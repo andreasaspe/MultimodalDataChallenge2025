@@ -160,9 +160,9 @@ def train_fungi_network(data_file, image_path, checkpoint_dir):
         
         # Start epoch timer
         epoch_start_time = time.time()
-                
+        
         # Training Loop
-        for images, labels, _ in tqdm.tqdm(train_loader):
+        for images, labels, _ in train_loader:
             images, labels = images.to(device), labels.to(device)
             optimizer.zero_grad()
             outputs = model(images)
@@ -187,7 +187,7 @@ def train_fungi_network(data_file, image_path, checkpoint_dir):
         
         # Validation Loop
         with torch.no_grad():
-            for images, labels, _ in tqdm.tqdm(valid_loader):
+            for images, labels, _ in valid_loader:
                 images, labels = images.to(device), labels.to(device)
                 outputs = model(images)
                 val_loss += criterion(outputs, labels).item()
@@ -275,16 +275,16 @@ def evaluate_network_on_test_set(data_file, image_path, checkpoint_dir, session_
 
 if __name__ == "__main__":
     # Path to fungi images
-    image_path = "/home/awias/data/Summerschool_2025/FungiImages"
+    image_path = "home/awias/data/Summerschool_2025/FungiImages"
     # Path to metadata file
-    data_file = "/home/awias/data/Summerschool_2025/metadata.csv"
+    data_file = "home/awias/data/Summerschool_2025/metadata.csv"
 
     # Session name: Change session name for every experiment! 
     # Session name will be saved as the first line of the prediction file
     session = "EfficientNet"
 
     # Folder for results of this experiment based on session name:
-    checkpoint_dir = os.path.join(f"/home/awias/data/Summerschool_2025/results/{session}/")
+    checkpoint_dir = os.path.join(f"/novo/projects/shared_projects/eye_imaging/code/FungiChallenge/results/{session}/")
 
     train_fungi_network(data_file, image_path, checkpoint_dir)
     evaluate_network_on_test_set(data_file, image_path, checkpoint_dir, session)

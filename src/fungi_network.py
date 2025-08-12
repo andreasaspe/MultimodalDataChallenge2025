@@ -128,12 +128,12 @@ def train_fungi_network(data_file, image_path, checkpoint_dir):
     # Initialize DataLoaders
     train_dataset = FungiDataset(train_df, image_path, transform=get_transforms(data='train'))
     valid_dataset = FungiDataset(val_df, image_path, transform=get_transforms(data='valid'))
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
-    valid_loader = DataLoader(valid_dataset, batch_size=32, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4)
+    valid_loader = DataLoader(valid_dataset, batch_size=8, shuffle=False, num_workers=4)
 
     # Network Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = models.efficientnet_b0(pretrained=True)
+    model = models.efficientnet_b7(pretrained=True)
     model.classifier = nn.Sequential(
         nn.Dropout(0.2),
         nn.Linear(model.classifier[1].in_features, len(train_df['taxonID_index'].unique()))
@@ -275,16 +275,15 @@ def evaluate_network_on_test_set(data_file, image_path, checkpoint_dir, session_
 
 if __name__ == "__main__":
     # Path to fungi images
-    image_path = "/home/awias/data/Summerschool_2025/FungiImages"
-    # Path to metadata file
-    data_file = "/home/awias/data/Summerschool_2025/metadata.csv"
+    image_path = '/home/mmilo/FungiImages/'
+    data_file = '/home/mmilo/MultimodalDataChallenge2025/metadata_more.csv'
 
     # Session name: Change session name for every experiment! 
     # Session name will be saved as the first line of the prediction file
-    session = "EfficientNet"
+    session = "EfficientNet_b7"
 
     # Folder for results of this experiment based on session name:
-    checkpoint_dir = os.path.join(f"/home/awias/data/Summerschool_2025/results/{session}/")
+    checkpoint_dir = os.path.join(f"/home/mmilo/Summerschool_2025/results/{session}/")
 
     train_fungi_network(data_file, image_path, checkpoint_dir)
     evaluate_network_on_test_set(data_file, image_path, checkpoint_dir, session)

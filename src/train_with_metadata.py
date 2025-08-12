@@ -134,11 +134,17 @@ class MultiModalEfficientNet(nn.Module):
         super().__init__()
         self.backbone = models.efficientnet_b0(pretrained=True)
         in_features = self.backbone.classifier[1].in_features
-        self.backbone.classifier = nn.Identity()
+        # self.backbone.classifier = nn.Identity()
         # load weights from path
-        # self.load_weights("/home/mmilo/FungiChallenge/results/EfficientNet_20250812_091422/best_accuracy.pth")
-
-        
+        self.backbone.classifier = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(in_features, 183)
+        )
+        self.load_weights("/home/mmilo/FungiChallenge/results/EfficientNet_20250812_091422/best_accuracy.pth")
+        self.backbone.classifier = nn.Identity()  # Remove the final classifier for custom head
+        # Freeze the backbone to prevent training  
+        for param in self.backbone.parameters():
+            param.requires_grad = False      
 
         # Embeddings for categorical features
         self.embeddings = nn.ModuleList([
@@ -193,24 +199,30 @@ class MultiModalEfficientNet(nn.Module):
 # -------------------------
 # Training function
 # -------------------------
-def train_fungi_network(data_file, image_path, checkpoint_dir, categorical_keys, continuous_keys, tokenizers=None):
+def train_fungi_network(data_file, image_path, checkpoint_dir, categorical_keys, continuous_keys, tokenizers=None, drop_na=True):
     ensure_folder(checkpoint_dir)
     csv_file_path = os.path.join(checkpoint_dir, 'train.csv')
     initialize_csv_logger(csv_file_path)
 
     df = pd.read_csv(data_file)
     train_df = df[df['filename_index'].str.startswith('fungi_train')]
+    meta_keys = (categorical_keys if categorical_keys else []) + (continuous_keys if continuous_keys else [])
+
+    if drop_na and meta_keys:
+        train_df = train_df.dropna(subset=meta_keys)
+        
     train_df, val_df = train_test_split(train_df, test_size=0.2, random_state=42)
 
+    # Drop NA in meta columns for both train and val
+    # print size after dropping
+    print('Training size', len(train_df))
+    print('Validation size', len(val_df))
     # Tokenize categorical columns
     if categorical_keys:
         if tokenizers is None:
             tokenizers = create_categorical_tokenizers(df, categorical_keys)
         train_df = apply_tokenizers(train_df, tokenizers)
         val_df = apply_tokenizers(val_df, tokenizers)
-
-    print('Training size', len(train_df))
-    print('Validation size', len(val_df))
 
     categorical_cardinalities = [len(tokenizers[k]) if k in tokenizers else 0 for k in categorical_keys]
     num_continuous = len(continuous_keys)
@@ -223,7 +235,7 @@ def train_fungi_network(data_file, image_path, checkpoint_dir, categorical_keys,
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = MultiModalEfficientNet(
-        num_classes=len(train_df['taxonID_index'].unique()),
+        num_classes=183,
         categorical_cardinalities=categorical_cardinalities,
         num_continuous=num_continuous,
         embed_dim=32,
@@ -234,7 +246,7 @@ def train_fungi_network(data_file, image_path, checkpoint_dir, categorical_keys,
     scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.9, patience=1, verbose=True, eps=1e-6)
     criterion = nn.CrossEntropyLoss()
 
-    patience = 10
+    patience = 3
     patience_counter = 0
     best_loss = np.inf
     best_accuracy = 0.0
@@ -308,6 +320,7 @@ def train_fungi_network(data_file, image_path, checkpoint_dir, categorical_keys,
 # Evaluation
 # -------------------------
 def evaluate_network_on_test_set(data_file, image_path, checkpoint_dir, session_name, categorical_keys, continuous_keys, tokenizers=None):
+    pass
     ensure_folder(checkpoint_dir)
 
     best_trained_model = os.path.join(checkpoint_dir, "best_accuracy.pth")
@@ -328,7 +341,7 @@ def evaluate_network_on_test_set(data_file, image_path, checkpoint_dir, session_
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = MultiModalEfficientNet(
-        num_classes=len(df['taxonID_index'].unique()),
+        num_classes=183,
         categorical_cardinalities=categorical_cardinalities,
         num_continuous=num_continuous,
         embed_dim=32,
@@ -359,7 +372,7 @@ def evaluate_network_on_test_set(data_file, image_path, checkpoint_dir, session_
 if __name__ == "__main__":
     seed_torch(42)
     image_path = '/home/mmilo/FungiImages/'
-    data_file = '/home/mmilo/MultimodalDataChallenge2025/metadata.csv'
+    data_file = '/home/mmilo/MultimodalDataChallenge2025/metadata_more.csv'
 
     # Define which keys are categorical and which are continuous
     categorical_keys = ["Habitat", "Substrate"]
@@ -376,7 +389,7 @@ if __name__ == "__main__":
         cats = [cat]
         conts = []
         print(f"Training with categorical: {cats}, continuous: {conts}")
-        session = f"EfficientNet_{cat}_none_{time.strftime('%Y%m%d_%H%M%S')}"
+        session = f"drop_na_{cat}_none_{time.strftime('%Y%m%d_%H%M%S')}"
         checkpoint_dir = os.path.join(f"/home/mmilo/FungiChallenge/results/{session}/")
 
         acc, loss, used_tokenizers = train_fungi_network(
@@ -391,7 +404,7 @@ if __name__ == "__main__":
     cats = []
     conts = continuous_keys
     print(f"Training with categorical: {cats}, continuous: {conts}")
-    session = f"EfficientNet_none_{'_'.join(conts)}_{time.strftime('%Y%m%d_%H%M%S')}"
+    session = f"drop_na_none_{'_'.join(conts)}_{time.strftime('%Y%m%d_%H%M%S')}"
     checkpoint_dir = os.path.join(f"/home/mmilo/FungiChallenge/results/{session}/")
 
     acc, loss, used_tokenizers = train_fungi_network(
@@ -406,9 +419,23 @@ if __name__ == "__main__":
     cats = categorical_keys
     conts = []
     print(f"Training with categorical: {cats}, continuous: {conts}")
-    session = f"EfficientNet_{'_'.join(cats)}_none_{time.strftime('%Y%m%d_%H%M%S')}"
+    session = f"drop_na_{'_'.join(cats)}_none_{time.strftime('%Y%m%d_%H%M%S')}"
     checkpoint_dir = os.path.join(f"/home/mmilo/FungiChallenge/results/{session}/")
 
+    acc, loss, used_tokenizers = train_fungi_network(
+        data_file, image_path, checkpoint_dir, cats, conts, tokenizers=tokenizers if cats else None
+    )
+    results.append((session, acc, loss))
+    evaluate_network_on_test_set(
+        data_file, image_path, checkpoint_dir, session, cats, conts, tokenizers=used_tokenizers if cats else None
+    )
+    
+    # train with all categorical and continuous keys
+    cats = categorical_keys
+    conts = continuous_keys
+    print(f"Training with categorical: {cats}, continuous: {conts}")
+    session = f"drop_na_{'_'.join(cats)}_{'_'.join(conts)}_{time.strftime('%Y%m%d_%H%M%S')}"
+    checkpoint_dir = os.path.join(f"/home/mmilo/FungiChallenge/results/{session}/")
     acc, loss, used_tokenizers = train_fungi_network(
         data_file, image_path, checkpoint_dir, cats, conts, tokenizers=tokenizers if cats else None
     )

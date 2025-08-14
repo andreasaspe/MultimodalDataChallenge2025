@@ -65,17 +65,21 @@ def get_transforms(data):
         raise ValueError("Unknown mode (train/valid)")
 
 def create_categorical_tokenizers(df, categorical_keys):
-    """Create a mapping from category value to integer for each categorical column."""
+    """Create a mapping from category value to integer for each categorical column, reserving the last index for NaN."""
     tokenizers = {}
     for key in categorical_keys:
         unique_vals = sorted(df[key].dropna().unique())
-        tokenizers[key] = {val: idx for idx, val in enumerate(unique_vals)}
+        mapping = {val: idx for idx, val in enumerate(unique_vals)}
+        nan_token = len(mapping)  # Reserve the last index for NaN
+        mapping["__nan__"] = nan_token
+        tokenizers[key] = mapping
     return tokenizers
 
 def apply_tokenizers(df, tokenizers):
-    """Apply the categorical tokenizers to the DataFrame in-place."""
+    """Apply the categorical tokenizers to the DataFrame in-place, mapping NaN to the special token."""
     for key, mapping in tokenizers.items():
-        df[key] = df[key].map(lambda x: mapping.get(x, 0))  # Unknowns mapped to 0
+        nan_token = mapping["__nan__"]
+        df[key] = df[key].map(lambda x: mapping.get(x, nan_token))
     return df
 
 # -------------------------
@@ -201,6 +205,63 @@ import torch.nn as nn
 import timm  # for pretrained ViT
 import os
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2, alpha=None, reduction='mean', num_classes=None, task_type='multi-class'):
+        """
+        Focal Loss for multi-class or binary classification.
+        Args:
+            gamma (float): focusing parameter.
+            alpha (list, float, or None): class weights. If None, no weighting.
+            reduction (str): 'mean', 'sum', or 'none'.
+            num_classes (int): number of classes (required for multi-class).
+            task_type (str): 'multi-class' or 'binary'.
+        """
+        super().__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+        self.task_type = task_type
+        self.num_classes = num_classes
+
+        if alpha is not None:
+            if isinstance(alpha, (list, torch.Tensor)):
+                self.alpha = torch.tensor(alpha, dtype=torch.float32)
+            else:
+                self.alpha = torch.tensor([alpha], dtype=torch.float32)
+        else:
+            self.alpha = None
+
+    def forward(self, input, target):
+        if self.task_type == 'multi-class':
+            # input: (batch, num_classes), target: (batch,)
+            logpt = F.log_softmax(input, dim=1)
+            pt = torch.exp(logpt)
+            logpt = logpt.gather(1, target.unsqueeze(1)).squeeze(1)
+            pt = pt.gather(1, target.unsqueeze(1)).squeeze(1)
+            if self.alpha is not None:
+                at = self.alpha.to(input.device)[target]
+                logpt = logpt * at
+            loss = -((1 - pt) ** self.gamma) * logpt
+        elif self.task_type == 'binary':
+            # input: (batch,), target: (batch,)
+            logpt = F.logsigmoid(input)
+            pt = torch.exp(logpt)
+            if self.alpha is not None:
+                at = self.alpha.to(input.device)
+                logpt = logpt * at
+            loss = -((1 - pt) ** self.gamma) * logpt
+        else:
+            raise ValueError("Unknown task_type: choose 'multi-class' or 'binary'.")
+
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
 
 class SimpleMultiModalFusion(nn.Module):
     def __init__(self, num_classes, categorical_cardinalities, num_continuous,
@@ -210,6 +271,7 @@ class SimpleMultiModalFusion(nn.Module):
         # Load pretrained ViT base (patch16_224)
         self.vit = timm.create_model('vit_base_patch16_224', pretrained=True)
         self.vit.reset_classifier(0)  # Remove classification head
+        
         
         if freeze_backbone:
             for param in self.vit.parameters():
@@ -288,7 +350,14 @@ class SimpleMultiModalFusion(nn.Module):
 # -------------------------
 # Training function
 # -------------------------
-def train_fungi_network(data_file, image_path, checkpoint_dir, categorical_keys, continuous_keys, tokenizers=None, drop_na=True):
+def train_fungi_network(data_file, 
+                        image_path, 
+                        checkpoint_dir, 
+                        categorical_keys, 
+                        continuous_keys, 
+                        tokenizers=None, 
+                        drop_na=True,
+                        n_epochs=100):
     ensure_folder(checkpoint_dir)
     csv_file_path = os.path.join(checkpoint_dir, 'train.csv')
     initialize_csv_logger(csv_file_path)
@@ -297,11 +366,11 @@ def train_fungi_network(data_file, image_path, checkpoint_dir, categorical_keys,
     train_df = df[df['filename_index'].str.startswith('fungi_train')]
     meta_keys = (categorical_keys if categorical_keys else []) + (continuous_keys if continuous_keys else [])
 
-    if drop_na and meta_keys:
-        train_df = train_df.dropna(subset=meta_keys)
-
     train_df, val_df = train_test_split(train_df, test_size=0.2, random_state=42, stratify=train_df['taxonID_index'])
 
+    if drop_na and meta_keys:
+        train_df = train_df.dropna(subset=meta_keys)
+        val_df = val_df.dropna(subset=meta_keys)
     print('Training size:', len(train_df))
     print('Validation size:', len(val_df))
 
@@ -325,21 +394,23 @@ def train_fungi_network(data_file, image_path, checkpoint_dir, categorical_keys,
         num_classes=183,
         categorical_cardinalities=categorical_cardinalities,
         num_continuous=num_continuous,
-        freeze_backbone=False
+        freeze_backbone=True
     ).to(device)
 
 
 
     optimizer = Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
     scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=2, verbose=True, eps=1e-6)
+    
+    criterion = FocalLoss(gamma=2, task_type='multi-class', num_classes=183)
     criterion = nn.CrossEntropyLoss()
 
-    patience = 5
+    patience = 20
     patience_counter = 0
     best_loss = np.inf
     best_accuracy = 0.0
 
-    for epoch in range(100):
+    for epoch in range(n_epochs):
         model.train()
         train_loss, total_correct_train, total_train_samples = 0.0, 0, 0
         epoch_start_time = time.time()
@@ -399,7 +470,7 @@ def train_fungi_network(data_file, image_path, checkpoint_dir, categorical_keys,
             torch.save(model.state_dict(), os.path.join(checkpoint_dir, "best_accuracy.pth"))
             print(f"New best accuracy: {best_accuracy:.4f}")
             # save vit part of model
-            torch.save(model.vit.state_dict(), os.path.join(checkpoint_dir, "vit_weights.pth"))
+            # torch.save(model.vit.state_dict(), os.path.join(checkpoint_dir, "vit_weights.pth"))
 
         if avg_val_loss < best_loss:
             best_loss = avg_val_loss
@@ -419,7 +490,7 @@ def train_fungi_network(data_file, image_path, checkpoint_dir, categorical_keys,
 # Evaluation
 # -------------------------
 def evaluate_network_on_test_set(data_file, image_path, checkpoint_dir, session_name, categorical_keys, continuous_keys, tokenizers=None):
-    return
+    
     ensure_folder(checkpoint_dir)
 
     best_trained_model = os.path.join(checkpoint_dir, "best_accuracy.pth")
@@ -439,12 +510,11 @@ def evaluate_network_on_test_set(data_file, image_path, checkpoint_dir, session_
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = MultiModalEfficientNet(
+    model = SimpleMultiModalFusion(
         num_classes=183,
         categorical_cardinalities=categorical_cardinalities,
         num_continuous=num_continuous,
-        embed_dim=32,
-        mlp_hidden=64
+        freeze_backbone=True
     )
     model.load_state_dict(torch.load(best_trained_model))
     model.to(device)
@@ -471,7 +541,7 @@ def evaluate_network_on_test_set(data_file, image_path, checkpoint_dir, session_
 if __name__ == "__main__":
     seed_torch(42)
     image_path = '/home/mmilo/FungiImages/'
-    data_file = '/home/mmilo/MultimodalDataChallenge2025/metadata_more.csv'
+    data_file = '/home/mmilo/MultimodalDataChallenge2025/metadata_v4.csv'
 
     # Define which keys are categorical and which are continuous
     categorical_keys = ["Habitat", "Substrate"]
@@ -484,74 +554,76 @@ if __name__ == "__main__":
     tokenizers = create_categorical_tokenizers(df_all, categorical_keys)
     
     # 0. no metadata (baseline)
-    print("Training without any metadata")
-    session = "the_bear_no_metadata"
-    checkpoint_dir = os.path.join(f"/home/mmilo/FungiChallenge/results/{session}/")
-    ensure_folder(checkpoint_dir)
-    acc, loss, used_tokenizers = train_fungi_network(
-        data_file, image_path, checkpoint_dir, [], [], tokenizers=None
-    )
-    results.append((session, acc, loss))
+    # print("Training without any metadata")
+    # session = "the_bear_no_metadata"
+    # checkpoint_dir = os.path.join(f"/home/mmilo/FungiChallenge/results/{session}/")
+    # ensure_folder(checkpoint_dir)
+    # acc, loss, used_tokenizers = train_fungi_network(
+    #     data_file, image_path, checkpoint_dir, [], [], tokenizers=None
+    # )
+    # results.append((session, acc, loss))
 
     # 1. Each categorical key alone (no continuous)
-    for cat in categorical_keys:
-        cats = [cat]
-        conts = []
-        print(f"Training with categorical: {cats}, continuous: {conts}")
-        session = f"the_bear_{cat}"
-        checkpoint_dir = os.path.join(f"/home/mmilo/FungiChallenge/results/{session}/")
+    # for cat in categorical_keys:
+    #     cats = [cat]
+    #     conts = []
+    #     print(f"Training with categorical: {cats}, continuous: {conts}")
+    #     session = f"the_bear_{cat}"
+    #     checkpoint_dir = os.path.join(f"/home/mmilo/FungiChallenge/results/{session}/")
 
-        acc, loss, used_tokenizers = train_fungi_network(
-            data_file, image_path, checkpoint_dir, cats, conts, tokenizers=tokenizers if cats else None
-        )
-        results.append((session, acc, loss))
-        evaluate_network_on_test_set(
-            data_file, image_path, checkpoint_dir, session, cats, conts, tokenizers=used_tokenizers if cats else None
-        )
+    #     acc, loss, used_tokenizers = train_fungi_network(
+    #         data_file, image_path, checkpoint_dir, cats, conts, tokenizers=tokenizers if cats else None
+    #     )
+    #     results.append((session, acc, loss))
+    #     evaluate_network_on_test_set(
+    #         data_file, image_path, checkpoint_dir, session, cats, conts, tokenizers=used_tokenizers if cats else None
+    #     )
 
-    # 2. Latitude and Longitude together (no categorical)
-    cats = []
-    conts = continuous_keys
-    print(f"Training with categorical: {cats}, continuous: {conts}")
-    session = f"the_bear_{'_'.join(conts)}"
-    checkpoint_dir = os.path.join(f"/home/mmilo/FungiChallenge/results/{session}/")
+    # # 2. Latitude and Longitude together (no categorical)
+    # cats = []
+    # conts = continuous_keys
+    # print(f"Training with categorical: {cats}, continuous: {conts}")
+    # session = f"the_bear_{'_'.join(conts)}"
+    # checkpoint_dir = os.path.join(f"/home/mmilo/FungiChallenge/results/{session}/")
 
-    acc, loss, used_tokenizers = train_fungi_network(
-        data_file, image_path, checkpoint_dir, cats, conts, tokenizers=None
-    )
-    results.append((session, acc, loss))
-    evaluate_network_on_test_set(
-        data_file, image_path, checkpoint_dir, session, cats, conts, tokenizers=None
-    )
+    # acc, loss, used_tokenizers = train_fungi_network(
+    #     data_file, image_path, checkpoint_dir, cats, conts, tokenizers=None
+    # )
+    # results.append((session, acc, loss))
+    # evaluate_network_on_test_set(
+    #     data_file, image_path, checkpoint_dir, session, cats, conts, tokenizers=None
+    # )
 
     # 3. Optionally, all categorical keys together (no continuous)
     cats = categorical_keys
     conts = []
     print(f"Training with categorical: {cats}, continuous: {conts}")
-    session = f"the_bear_{'_'.join(cats)}"
+    session = f"the_bear_focal"
     checkpoint_dir = os.path.join(f"/home/mmilo/FungiChallenge/results/{session}/")
 
     acc, loss, used_tokenizers = train_fungi_network(
-        data_file, image_path, checkpoint_dir, cats, conts, tokenizers=tokenizers if cats else None
+        data_file, image_path, checkpoint_dir, cats, conts, tokenizers=tokenizers if cats else None,
+        n_epochs=100
     )
     results.append((session, acc, loss))
+    
     evaluate_network_on_test_set(
         data_file, image_path, checkpoint_dir, session, cats, conts, tokenizers=used_tokenizers if cats else None
     )
     
     # train with all categorical and continuous keys
-    cats = categorical_keys
-    conts = continuous_keys
-    print(f"Training with categorical: {cats}, continuous: {conts}")
-    session = f"the_bear_{'_'.join(cats)}_{'_'.join(conts)}"
-    checkpoint_dir = os.path.join(f"/home/mmilo/FungiChallenge/results/{session}/")
-    acc, loss, used_tokenizers = train_fungi_network(
-        data_file, image_path, checkpoint_dir, cats, conts, tokenizers=tokenizers if cats else None
-    )
-    results.append((session, acc, loss))
-    evaluate_network_on_test_set(
-        data_file, image_path, checkpoint_dir, session, cats, conts, tokenizers=used_tokenizers if cats else None
-    )
+    # cats = categorical_keys
+    # conts = continuous_keys
+    # print(f"Training with categorical: {cats}, continuous: {conts}")
+    # session = f"the_bear_{'_'.join(cats)}_{'_'.join(conts)}"
+    # checkpoint_dir = os.path.join(f"/home/mmilo/FungiChallenge/results/{session}/")
+    # acc, loss, used_tokenizers = train_fungi_network(
+    #     data_file, image_path, checkpoint_dir, cats, conts, tokenizers=tokenizers if cats else None
+    # )
+    # results.append((session, acc, loss))
+    # evaluate_network_on_test_set(
+    #     data_file, image_path, checkpoint_dir, session, cats, conts, tokenizers=used_tokenizers if cats else None
+    # )
 
-    for session, acc, loss in results:
-        print(f"Session: {session}\n Best Accuracy: {acc:.4f}, Best Loss: {loss:.4f}\n")
+    # for session, acc, loss in results:
+    #     print(f"Session: {session}\n Best Accuracy: {acc:.4f}, Best Loss: {loss:.4f}\n")

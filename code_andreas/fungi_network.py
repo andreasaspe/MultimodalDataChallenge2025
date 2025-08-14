@@ -301,8 +301,8 @@ def train_fungi_network(data_file, image_path, checkpoint_dir, multi_modal=False
     Incorporates early stopping with a patience of 10 epochs.
     """
     # Ensure checkpoint directory exists
-    CameraModelSTxt = 'C:/Users/bmsha/sc2025/metadata_1/camera_models.txt'
-    CameraMakerTxt = 'C:/Users/bmsha/sc2025/metadata_1/camera_makers.txt'
+    CameraModelSTxt = '/home/awias/data/Summerschool_2025/metadata_1/camera_models.txt'
+    CameraMakerTxt = '/home/awias/data/Summerschool_2025/metadata_1/camera_makers.txt'
     
     ensure_folder(checkpoint_dir)
 
@@ -524,9 +524,9 @@ def evaluate_network_on_test_set(data_file, image_path, checkpoint_dir, session_
     Evaluate network on the test set and save predictions to a CSV file.
     """
     # Ensure checkpoint directory exists
-    CameraModelSTxt = 'C:/Users/bmsha/sc2025/metadata_1/camera_models.txt'
-    CameraMakerTxt = 'C:/Users/bmsha/sc2025/metadata_1/camera_makers.txt'
-    
+    CameraModelSTxt = '/home/awias/data/Summerschool_2025/metadata_1/camera_models.txt'
+    CameraMakerTxt = '/home/awias/data/Summerschool_2025/metadata_1/camera_makers.txt'
+
     ensure_folder(checkpoint_dir)
 
     # Model and Test Setup
@@ -602,9 +602,9 @@ def evaluate_network_on_test_set(data_file, image_path, checkpoint_dir, session_
 
 if __name__ == "__main__":
     # Path to fungi images
-    image_path = 'C:/Users/bmsha/sc2025/FungiImages'
+    image_path = '/home/awias/data/Summerschool_2025/FungiImages'
     # Path to metadata file
-    data_file = str('C:/Users/bmsha/sc2025/metadata_1/metadata_fused.csv')
+    data_file = str('/home/awias/data/Summerschool_2025/metadata_1/metadata_fused.csv')
 
     # Session name: Change session name for every experiment! 
     # Session name will be saved as the first line of the prediction file

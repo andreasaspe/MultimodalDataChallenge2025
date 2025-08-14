@@ -234,9 +234,9 @@ def train_fungi_network(data_file, image_path, checkpoint_dir, multi_modal=False
     Incorporates early stopping with a patience of 10 epochs.
     """
     # Ensure checkpoint directory exists
-    CameraModelSTxt = 'C:/Users/bmsha/sc2025/metadata_1/camera_models.txt'
-    CameraMakerTxt = 'C:/Users/bmsha/sc2025/metadata_1/camera_makers.txt'
-    
+    CameraModelSTxt = '/home/awias/data/Summerschool_2025/metadata_1/camera_models.txt'
+    CameraMakerTxt = '/home/awias/data/Summerschool_2025/metadata_1/camera_makers.txt'
+
     ensure_folder(checkpoint_dir)
 
     # Set Logger
@@ -569,16 +569,16 @@ def evaluate_network_on_test_set(data_file, image_path, checkpoint_dir, session_
 
 if __name__ == "__main__":
     # Path to fungi images
-    image_path = "home/awias/data/Summerschool_2025/FungiImages"
+    image_path = "/home/awias/data/Summerschool_2025/FungiImages"
     # Path to metadata file
-    data_file = 'home/awias/data/Summerschool_2025/metadata_fused.csv'
+    data_file = '/home/awias/data/Summerschool_2025/metadata_1/metadata_fused.csv'
 
     # Session name: Change session name for every experiment! 
     # Session name will be saved as the first line of the prediction file
     session = "firsttry"
     wandb_bool = True
     # Folder for results of this experiment based on session name:
-    checkpoint_dir = os.path.join(f"home/awias/data/Summerschool_2025/checkpoints/{session}/")
+    checkpoint_dir = os.path.join(f"/home/awias/data/Summerschool_2025/checkpoints/{session}/")
     seed_torch(42)  # Set random seed for reproducibility
     train_fungi_network(data_file, image_path, checkpoint_dir, multi_modal=True, wandb_bool=wandb_bool)
     wandb.finish() if wandb_bool else None

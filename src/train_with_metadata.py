@@ -196,6 +196,95 @@ class MultiModalEfficientNet(nn.Module):
         else:
             print("Using default pretrained weights for EfficientNet-B0.")
 
+import torch
+import torch.nn as nn
+import timm  # for pretrained ViT
+import os
+
+
+class SimpleMultiModalFusion(nn.Module):
+    def __init__(self, num_classes, categorical_cardinalities, num_continuous,
+                 embed_dim=32, mlp_hidden=128, freeze_backbone=True):
+        super().__init__()
+        
+        # Load pretrained ViT base (patch16_224)
+        self.vit = timm.create_model('vit_base_patch16_224', pretrained=True)
+        self.vit.reset_classifier(0)  # Remove classification head
+        
+        if freeze_backbone:
+            for param in self.vit.parameters():
+                param.requires_grad = False
+        
+        # Embeddings for categorical features
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(num_embeddings=card, embedding_dim=embed_dim)
+            for card in categorical_cardinalities
+        ])
+        
+        self.num_continuous = num_continuous
+        
+        # Calculate input dim for metadata MLP
+        meta_in_dim = embed_dim * len(categorical_cardinalities) + num_continuous
+        
+        # Metadata MLP
+        self.meta_mlp = nn.Sequential(
+            nn.Linear(meta_in_dim, mlp_hidden),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+        
+        vit_embed_dim = self.vit.embed_dim  # Typically 768 for vit_base_patch16_224
+        
+        # Final classifier head with layer normalization
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(vit_embed_dim + mlp_hidden),
+            nn.Linear(vit_embed_dim + mlp_hidden, mlp_hidden),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(mlp_hidden, num_classes)
+        )
+        
+        self.load_vit_model()  # Load weights if available
+        
+        
+    def forward(self, images, cat_extras, cont_extras):
+        B = images.size(0)
+        
+        # Extract ViT features from CLS token
+        vit_tokens = self.vit.forward_features(images)  # (B, num_patches+1, D)
+        cls_token = vit_tokens[:, 0, :]  # CLS token (B, D)
+        
+        # Embed categorical features and concatenate
+        if self.embeddings:
+            embeds = [emb(extra) for emb, extra in zip(self.embeddings, cat_extras)]
+            embeds = torch.cat(embeds, dim=1) if embeds else torch.empty((B, 0), device=images.device)
+        else:
+            embeds = torch.empty((B, 0), device=images.device)
+        
+        # Concatenate continuous features
+        if cont_extras:
+            cont_feats = torch.cat(cont_extras, dim=1)
+        else:
+            cont_feats = torch.empty((B, 0), device=images.device)
+        
+        meta_feats = torch.cat([embeds, cont_feats], dim=1)
+        meta_feats = self.meta_mlp(meta_feats)
+        
+        # Concatenate ViT CLS features and metadata features
+        combined = torch.cat([cls_token, meta_feats], dim=1)
+        
+        # Classification
+        return self.classifier(combined)
+    
+    def load_vit_model(self, path="/home/mmilo/FungiChallenge/results/the_bear_no_metadata/vit_weights.pth"):
+        """Load weights from a given path or use default pretrained weights."""
+        if path and os.path.exists(path):
+            self.vit.load_state_dict(torch.load(path))
+            print(f"Loaded weights from {path}")
+        else:
+            print("Using default pretrained weights for ViT.")
+
+
 # -------------------------
 # Training function
 # -------------------------
@@ -210,14 +299,12 @@ def train_fungi_network(data_file, image_path, checkpoint_dir, categorical_keys,
 
     if drop_na and meta_keys:
         train_df = train_df.dropna(subset=meta_keys)
-        
-    train_df, val_df = train_test_split(train_df, test_size=0.2, random_state=42)
 
-    # Drop NA in meta columns for both train and val
-    # print size after dropping
-    print('Training size', len(train_df))
-    print('Validation size', len(val_df))
-    # Tokenize categorical columns
+    train_df, val_df = train_test_split(train_df, test_size=0.2, random_state=42, stratify=train_df['taxonID_index'])
+
+    print('Training size:', len(train_df))
+    print('Validation size:', len(val_df))
+
     if categorical_keys:
         if tokenizers is None:
             tokenizers = create_categorical_tokenizers(df, categorical_keys)
@@ -230,23 +317,24 @@ def train_fungi_network(data_file, image_path, checkpoint_dir, categorical_keys,
     train_dataset = FungiDataset(train_df, image_path, categorical_keys=categorical_keys, continuous_keys=continuous_keys, transform=get_transforms('train'))
     valid_dataset = FungiDataset(val_df, image_path, categorical_keys=categorical_keys, continuous_keys=continuous_keys, transform=get_transforms('valid'))
 
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=32)
-    valid_loader = DataLoader(valid_dataset, batch_size=64, shuffle=False, num_workers=32)
+    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=32, pin_memory=True)
+    valid_loader = DataLoader(valid_dataset, batch_size=128, shuffle=False, num_workers=32, pin_memory=True)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = MultiModalEfficientNet(
+    model = SimpleMultiModalFusion(
         num_classes=183,
         categorical_cardinalities=categorical_cardinalities,
         num_continuous=num_continuous,
-        embed_dim=32,
-        mlp_hidden=64
+        freeze_backbone=False
     ).to(device)
 
-    optimizer = Adam(model.parameters(), lr=0.001)
-    scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.9, patience=1, verbose=True, eps=1e-6)
+
+
+    optimizer = Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=2, verbose=True, eps=1e-6)
     criterion = nn.CrossEntropyLoss()
 
-    patience = 3
+    patience = 5
     patience_counter = 0
     best_loss = np.inf
     best_accuracy = 0.0
@@ -263,16 +351,24 @@ def train_fungi_network(data_file, image_path, checkpoint_dir, categorical_keys,
 
             optimizer.zero_grad()
             outputs = model(images, cat_extras, cont_extras)
+
+            if outputs.shape[0] != labels.shape[0]:
+                print("Warning: output and label batch size mismatch", outputs.shape, labels.shape)
+
             loss = criterion(outputs, labels)
             loss.backward()
+
+            # Gradient clipping to stabilize training
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
 
-            train_loss += loss.item()
+            train_loss += loss.item() * labels.size(0)
             total_correct_train += (outputs.argmax(1) == labels).sum().item()
             total_train_samples += labels.size(0)
 
         train_accuracy = total_correct_train / total_train_samples
-        avg_train_loss = train_loss / len(train_loader)
+        avg_train_loss = train_loss / total_train_samples
 
         model.eval()
         val_loss, total_correct_val, total_val_samples = 0.0, 0, 0
@@ -281,26 +377,29 @@ def train_fungi_network(data_file, image_path, checkpoint_dir, categorical_keys,
                 images, labels = images.to(device), labels.to(device)
                 cat_extras = [e.to(device) for e in cat_extras]
                 cont_extras = [e.to(device) for e in cont_extras]
+
                 outputs = model(images, cat_extras, cont_extras)
-                val_loss += criterion(outputs, labels).item()
+                val_loss += criterion(outputs, labels).item() * labels.size(0)
                 total_correct_val += (outputs.argmax(1) == labels).sum().item()
                 total_val_samples += labels.size(0)
 
         val_accuracy = total_correct_val / total_val_samples
-        avg_val_loss = val_loss / len(valid_loader)
+        avg_val_loss = val_loss / total_val_samples
         epoch_time = time.time() - epoch_start_time
 
-        print(f"Epoch {epoch+1}: "
-              f"Train Loss={avg_train_loss:.4f}, Train Acc={train_accuracy:.4f}, "
-              f"Val Loss={avg_val_loss:.4f}, Val Acc={val_accuracy:.4f}, "
-              f"Time={epoch_time:.2f}s")
+        print(f"Epoch {epoch+1}: Train Loss={avg_train_loss:.4f}, Train Acc={train_accuracy:.4f}, "
+              f"Val Loss={avg_val_loss:.4f}, Val Acc={val_accuracy:.4f}, Time={epoch_time:.2f}s")
 
         log_epoch_to_csv(csv_file_path, epoch+1, epoch_time, avg_train_loss, train_accuracy, avg_val_loss, val_accuracy)
+
+        scheduler.step(avg_val_loss)
 
         if val_accuracy > best_accuracy:
             best_accuracy = val_accuracy
             torch.save(model.state_dict(), os.path.join(checkpoint_dir, "best_accuracy.pth"))
             print(f"New best accuracy: {best_accuracy:.4f}")
+            # save vit part of model
+            torch.save(model.vit.state_dict(), os.path.join(checkpoint_dir, "vit_weights.pth"))
 
         if avg_val_loss < best_loss:
             best_loss = avg_val_loss
@@ -313,14 +412,14 @@ def train_fungi_network(data_file, image_path, checkpoint_dir, categorical_keys,
         if patience_counter >= patience:
             print("Early stopping triggered.")
             break
-        
+
     return best_accuracy, best_loss, tokenizers
 
 # -------------------------
 # Evaluation
 # -------------------------
 def evaluate_network_on_test_set(data_file, image_path, checkpoint_dir, session_name, categorical_keys, continuous_keys, tokenizers=None):
-    pass
+    return
     ensure_folder(checkpoint_dir)
 
     best_trained_model = os.path.join(checkpoint_dir, "best_accuracy.pth")
@@ -383,13 +482,23 @@ if __name__ == "__main__":
     # Create tokenizers once for all runs
     df_all = pd.read_csv(data_file)
     tokenizers = create_categorical_tokenizers(df_all, categorical_keys)
+    
+    # 0. no metadata (baseline)
+    print("Training without any metadata")
+    session = "the_bear_no_metadata"
+    checkpoint_dir = os.path.join(f"/home/mmilo/FungiChallenge/results/{session}/")
+    ensure_folder(checkpoint_dir)
+    acc, loss, used_tokenizers = train_fungi_network(
+        data_file, image_path, checkpoint_dir, [], [], tokenizers=None
+    )
+    results.append((session, acc, loss))
 
     # 1. Each categorical key alone (no continuous)
     for cat in categorical_keys:
         cats = [cat]
         conts = []
         print(f"Training with categorical: {cats}, continuous: {conts}")
-        session = f"drop_na_{cat}_none_{time.strftime('%Y%m%d_%H%M%S')}"
+        session = f"the_bear_{cat}"
         checkpoint_dir = os.path.join(f"/home/mmilo/FungiChallenge/results/{session}/")
 
         acc, loss, used_tokenizers = train_fungi_network(
@@ -404,7 +513,7 @@ if __name__ == "__main__":
     cats = []
     conts = continuous_keys
     print(f"Training with categorical: {cats}, continuous: {conts}")
-    session = f"drop_na_none_{'_'.join(conts)}_{time.strftime('%Y%m%d_%H%M%S')}"
+    session = f"the_bear_{'_'.join(conts)}"
     checkpoint_dir = os.path.join(f"/home/mmilo/FungiChallenge/results/{session}/")
 
     acc, loss, used_tokenizers = train_fungi_network(
@@ -419,7 +528,7 @@ if __name__ == "__main__":
     cats = categorical_keys
     conts = []
     print(f"Training with categorical: {cats}, continuous: {conts}")
-    session = f"drop_na_{'_'.join(cats)}_none_{time.strftime('%Y%m%d_%H%M%S')}"
+    session = f"the_bear_{'_'.join(cats)}"
     checkpoint_dir = os.path.join(f"/home/mmilo/FungiChallenge/results/{session}/")
 
     acc, loss, used_tokenizers = train_fungi_network(
@@ -434,7 +543,7 @@ if __name__ == "__main__":
     cats = categorical_keys
     conts = continuous_keys
     print(f"Training with categorical: {cats}, continuous: {conts}")
-    session = f"drop_na_{'_'.join(cats)}_{'_'.join(conts)}_{time.strftime('%Y%m%d_%H%M%S')}"
+    session = f"the_bear_{'_'.join(cats)}_{'_'.join(conts)}"
     checkpoint_dir = os.path.join(f"/home/mmilo/FungiChallenge/results/{session}/")
     acc, loss, used_tokenizers = train_fungi_network(
         data_file, image_path, checkpoint_dir, cats, conts, tokenizers=tokenizers if cats else None
